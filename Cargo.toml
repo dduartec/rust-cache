@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hashbrown = "0.15.2"
+lru = "0.12.5"
+
+[dev-dependencies]
+rstest = "0.24.0"
