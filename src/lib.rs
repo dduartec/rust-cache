@@ -3,19 +3,27 @@ use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-
-static RATIO: f64 = 1.3;
-
-
-
 struct Entry<D> {
     data: D,
     expiration: Instant,
 }
 
+impl<D> Entry<D> {
+    fn new(data: D, expiration: Instant) -> Self {
+        Entry {
+            data,
+            expiration,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.expiration > Instant::now()
+    }
+}
+
 pub struct Cache<K: Eq + Hash, D> {
     lru_cache: LruCache<K, Entry<D>>,
-    ttl: Duration, // seconds
+    positive_ttl: Duration, // seconds
 }
 
 impl<K: Eq + Hash, D: Eq> Cache<K, D> {
@@ -26,33 +34,45 @@ impl<K: Eq + Hash, D: Eq> Cache<K, D> {
         let hash_builder = DefaultHasher::default();
         Cache {
             lru_cache: LruCache::with_hasher(
-                NonZeroUsize::new((size as f64 * RATIO) as usize).unwrap(),
+                NonZeroUsize::new(size).unwrap(),
                 hash_builder,
             ),
-            ttl,
+            positive_ttl: ttl,
         }
     }
 
     pub fn insert(&mut self, key: K, data: D) {
-        let expiration = Instant::now() + self.ttl;
-        let data = Entry {data,expiration};
+        let expiration = Instant::now() + self.positive_ttl;
+        let data = Entry::new(data, expiration);
         self.lru_cache.put(key, data);
     }
 
     pub fn get(&mut self, key: &K) -> Option<&D> {
-        if let Some(entry) = self.lru_cache.get_mut(key) {
-            if entry.expiration > Instant::now() {
-                return Some(&entry.data);
-            }
+        // Check if the entry exists and is valid
+        let is_valid = if let Some(entry) = self.lru_cache.peek(key) {
+            entry.is_valid()
+        } else {
+            false
+        };
+
+        // If the entry is valid, return it
+        if is_valid {
+            self.lru_cache.get(key).map(|entry| &entry.data)
+        } else {
+            // If the entry is expired, remove it
             self.lru_cache.pop(key);
+            None
         }
-        None
     }
 
     pub fn len(&self) -> usize {
         self.lru_cache.len()
     }
 }
+
+// ===============================================================
+// =============================TESTS=============================
+// ===============================================================
 
 #[cfg(test)]
 mod tests {
@@ -166,17 +186,17 @@ mod tests {
     }
 
     #[rstest]
-    fn ttl_expired(mut basic: Cache<i32, i32>) {
+    fn ttl_expired(mut ttl: Cache<i32, i32>) {
         // Arrange
         let key = 1;
         let value = 2;
 
         // Act
-        basic.insert(key, value);
+        ttl.insert(key, value);
         std::thread::sleep(std::time::Duration::from_millis(250));
 
         // Assert
-        assert_eq!(basic.get(&key), None);
+        assert_eq!(ttl.get(&key), None);
     }
 
 }
