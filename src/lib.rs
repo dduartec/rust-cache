@@ -3,11 +3,20 @@ use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
+enum EntryStatus {
+    AVAILABLE,
+    CALCULATING,
+    READY,
+    FAILED,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct Entry<D> {
     data: D,
     adhoc_code: u8,
     expiration: Instant,
+    status: EntryStatus,
 }
 
 impl<D: Default> Entry<D> {
@@ -17,6 +26,7 @@ impl<D: Default> Entry<D> {
             data: Default::default(),
             expiration: Instant::now(),
             adhoc_code: 0,
+            status: EntryStatus::AVAILABLE,
         }
     }
 
@@ -26,6 +36,7 @@ impl<D: Default> Entry<D> {
             data,
             expiration,
             adhoc_code,
+            status: EntryStatus::AVAILABLE,
         }
     }
 
@@ -104,8 +115,10 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
 
         if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
             entry.expiration = Instant::now() + positive_ttl;
+            entry.status = EntryStatus::READY;
         } else {
             entry.expiration = Instant::now() + negative_ttl;
+            entry.status = EntryStatus::FAILED;
         }
     
         // Insert new entry
@@ -285,17 +298,18 @@ mod tests {
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let expiration_1 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        let entry_1 = simple_cache.lru_cache.peek(&key).unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
-        let expiration_2 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        let entry_2 = simple_cache.lru_cache.peek(&key).unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(100));
         simple_cache.retrieve_or_compute(&key);
-        let expiration_3 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        let entry_3 = simple_cache.lru_cache.peek(&key).unwrap().clone();
         
         // Assert
-        assert_eq!(expiration_1, expiration_2); // not expired
-        assert_ne!(expiration_1, expiration_3); // expired 
+        assert_eq!(entry_1.status, EntryStatus::READY);
+        assert_eq!(entry_1, entry_2); // not expired
+        assert_ne!(entry_1.expiration, entry_3.expiration); // expired 
     }
 
     #[rstest]
@@ -305,13 +319,14 @@ mod tests {
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let expiration_1 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        let entry_1 = simple_cache.lru_cache.peek(&key).unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
-        let expiration_2 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        let entry_2 = simple_cache.lru_cache.peek(&key).unwrap().clone();
         
         // Assert
-        assert_ne!(expiration_1, expiration_2); // expired because negative ttl is lower
+        assert_ne!(entry_1, entry_2); // expired because negative ttl is lower
+        assert_eq!(entry_1.status, EntryStatus::FAILED);
     }
 
 }
