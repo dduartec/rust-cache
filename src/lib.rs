@@ -99,7 +99,7 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
             return (&cache_entry.data, cache_entry.adhoc_code);
         }                
     
-        // Step 2: Handle cache miss
+        // Miss
         let mut entry: Entry<D> = Entry::default();
 
         if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
@@ -108,7 +108,7 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
             entry.expiration = Instant::now() + negative_ttl;
         }
     
-        // Step 3: Insert the new entry
+        // Insert new entry
         let cache_entry = self.lru_cache.get_or_insert_mut(*key, || entry);
         (&cache_entry.data, cache_entry.adhoc_code)
 
@@ -138,7 +138,7 @@ mod tests {
             3,
             miss_handler,
             Duration::from_millis(200),          
-            Duration::from_millis(200),          
+            Duration::from_millis(100),          
         )
     }
 
@@ -286,12 +286,32 @@ mod tests {
         // Act
         simple_cache.retrieve_or_compute(&key);
         let expiration_1 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(105));
+        simple_cache.retrieve_or_compute(&key);
+        let expiration_2 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        simple_cache.retrieve_or_compute(&key);
+        let expiration_3 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        
+        // Assert
+        assert_eq!(expiration_1, expiration_2); // not expired
+        assert_ne!(expiration_1, expiration_3); // expired 
+    }
+
+    #[rstest]
+    fn retrieve_or_compute_negative_ttl(mut simple_cache: Cache<i32, i32>){
+        // Arrange
+        let key = -1;
+
+        // Act
+        simple_cache.retrieve_or_compute(&key);
+        let expiration_1 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
+        std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
         let expiration_2 = simple_cache.lru_cache.peek(&key).unwrap().expiration;
         
-
-        assert_ne!(expiration_1, expiration_2);      
+        // Assert
+        assert_ne!(expiration_1, expiration_2); // expired because negative ttl is lower
     }
 
 }
