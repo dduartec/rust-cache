@@ -1,7 +1,9 @@
 use lru::{LruCache, DefaultHasher};
+use std::f32::consts::E;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Clone)]
 enum EntryStatus {
@@ -107,12 +109,28 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         if let Some(_) = self.get_entry(key) {
             // Hit
             let cache_entry = self.lru_cache.peek(&key).unwrap();
+            match cache_entry.status {
+                EntryStatus::READY => {
+                    return (&cache_entry.data, cache_entry.adhoc_code);
+                }
+                EntryStatus::FAILED => {
+                    return (&cache_entry.data, cache_entry.adhoc_code);
+                }
+                EntryStatus::CALCULATING => {
+                    //wait for the entry to change status
+                    while cache_entry.status == EntryStatus::CALCULATING {
+                        std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
+                    }
+                    return (&cache_entry.data, cache_entry.adhoc_code);
+                }
+                _ => {}
+            }
             return (&cache_entry.data, cache_entry.adhoc_code);
-        }                
+        }      
     
         // Miss
         let mut entry: Entry<D> = Entry::default();
-
+        entry.status = EntryStatus::CALCULATING;
         if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
             entry.expiration = Instant::now() + positive_ttl;
             entry.status = EntryStatus::READY;
@@ -134,15 +152,22 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use rstest::*;
 
     #[fixture]
     fn simple_cache() -> Cache<i32, i32> {
         fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8) -> bool {
+            // FAIL if key is -1
             if *key == -1 {
                 return false
             }
+            // take computing time if key is 456:
+            if *key == 456 {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+
             *data = 2;
             *adhoc_code+=1;
             true
@@ -328,5 +353,27 @@ mod tests {
         assert_ne!(entry_1, entry_2); // expired because negative ttl is lower
         assert_eq!(entry_1.status, EntryStatus::FAILED);
     }
+
+    // #[rstest]
+    // fn test_thread_safe_cache(mut simple_cache: Cache<i32, i32>) {
+    //     let cache = Arc::new(simple_cache);
+
+    //     let handles: Vec<_> = (0..10).map(|_| {
+    //         let cache_clone = Arc::clone(&cache);
+    //         thread::spawn(move || {
+    //             let key = 456;
+    //             let res = cache_clone.retrieve_or_compute(&key).clone();
+    //             res
+    //         })
+    //     }).collect();
+
+    //     let results = handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>();
+
+    //     // Additional checks to ensure all keys are present
+    //     for _ in 0..10 {
+    //         let key = 456;
+    //         assert_eq!(cache.get(&key), Some(results[0].0));
+    //     }
+    // }
 
 }
