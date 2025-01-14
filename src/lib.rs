@@ -1,9 +1,8 @@
 use lru::{LruCache, DefaultHasher};
-use std::f32::consts::E;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, PartialEq, Clone)]
 enum EntryStatus {
@@ -50,7 +49,7 @@ impl<D: Default> Entry<D> {
 type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
 
 pub struct Cache<K, D> {
-    lru_cache: LruCache<K, Entry<D>>,
+    lru_cache: Arc<RwLock<LruCache<K, Entry<D>>>>,
     miss_handler: MissHandler<K, D>,
     positive_ttl: Duration, // seconds
     negative_ttl: Duration, // seconds
@@ -65,67 +64,79 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
     ) -> Self {
         let hash_builder = DefaultHasher::default();
         Cache {
-            lru_cache: LruCache::with_hasher(
+            lru_cache: Arc::new(RwLock::new(LruCache::with_hasher(
                 NonZeroUsize::new(size).unwrap(),
                 hash_builder,
-            ),
+            ))),
             miss_handler,
             positive_ttl,
             negative_ttl,
         }
     }
 
-    pub fn insert(&mut self, key: &K, data: &D) {
+    pub fn insert(&self, key: &K, data: &D) {
         let expiration = Instant::now() + self.positive_ttl;
         let entry = Entry::new(*data, expiration, 0);
-        self.lru_cache.put(*key, entry);        
+        self.lru_cache.write().unwrap().put(*key, entry);        
     }
 
-    pub fn get(&mut self, key: &K) -> Option<&D> {
-        self.get_entry(key).map(|entry| &entry.data)
-    }
-
-    fn get_entry(&mut self, key: &K) -> Option<&Entry<D>> {
-        // First, check if the entry exists and is valid
-        if let Some(entry) = self.lru_cache.get(key) {
-            if entry.is_valid() {
-                return self.lru_cache.get(key);
+    pub fn get(&self, key: &K) -> Option<D> {
+            if self.is_in_cache(key) {
+                return self.lru_cache.write().unwrap().get(key).map(|entry| entry.data.clone());
             }
+            None
         }
+
+    fn is_in_cache(&self, key: &K) -> bool {
+        // First, check if the entry exists and is valid
+        let is_in_cache = {
+            let mut cache = self.lru_cache.write().unwrap();
+            if let Some(entry) = cache.get(key) {
+                entry.is_valid()
+            } else {
+                false
+            }            
+        };
+
+        if is_in_cache {
+            return true;
+        }
+
         // If the entry is expired, remove it
-        self.lru_cache.pop(key);
-        None
+        self.lru_cache.write().unwrap().pop(key);
+        false
     }
 
     pub fn len(&self) -> usize {
-        self.lru_cache.len()
+        self.lru_cache.read().unwrap().len()
     }
 
-    pub fn retrieve_or_compute(&mut self, key: &K) -> (&D, u8) {
+    pub fn retrieve_or_compute(&self, key: &K) -> (&D, u8) {
         let miss_handler = self.miss_handler;
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
         
-        if let Some(_) = self.get_entry(key) {
+        if self.is_in_cache(key) {
             // Hit
-            let cache_entry = self.lru_cache.peek(&key).unwrap();
+            let cache = self.lru_cache.read().unwrap();
+            let cache_entry = cache.peek(&key).unwrap();
             match cache_entry.status {
                 EntryStatus::READY => {
-                    return (&cache_entry.data, cache_entry.adhoc_code);
+                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
                 }
                 EntryStatus::FAILED => {
-                    return (&cache_entry.data, cache_entry.adhoc_code);
+                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
                 }
                 EntryStatus::CALCULATING => {
                     //wait for the entry to change status
                     while cache_entry.status == EntryStatus::CALCULATING {
                         std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
                     }
-                    return (&cache_entry.data, cache_entry.adhoc_code);
+                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
                 }
                 _ => {}
             }
-            return (&cache_entry.data, cache_entry.adhoc_code);
+            return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
         }      
     
         // Miss
@@ -140,8 +151,9 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         }
     
         // Insert new entry
-        let cache_entry = self.lru_cache.get_or_insert_mut(*key, || entry);
-        (&cache_entry.data, cache_entry.adhoc_code)
+        let mut binding = self.lru_cache.write().unwrap();
+        let cache_entry = binding.get_or_insert_mut(*key, || entry);
+        (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code)
 
     }
 }
@@ -152,6 +164,8 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
 
 #[cfg(test)]
 mod tests {
+
+    use std::thread;
 
     use super::*;
     use rstest::*;
@@ -168,8 +182,8 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
             }
 
-            *data = 2;
-            *adhoc_code+=1;
+            *data = key * 2;
+            *adhoc_code += 1; // should always be 1
             true
         }
         Cache::new(
@@ -181,7 +195,7 @@ mod tests {
     }
 
     #[rstest]
-    fn insert_value(mut simple_cache: Cache<i32, i32>) {
+    fn insert_value(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key = 1;
         let value = 2;
@@ -190,11 +204,11 @@ mod tests {
         simple_cache.insert(&key, &value);
 
         // Assert
-        assert_eq!(simple_cache.lru_cache.len(), 1);
+        assert_eq!(simple_cache.len(), 1);
     }
 
     #[rstest]
-    fn insert_same_key(mut simple_cache: Cache<i32, i32>) {
+    fn insert_same_key(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key = 1;
         let value = 2;
@@ -204,11 +218,11 @@ mod tests {
         simple_cache.insert(&key, &value);
 
         // Assert
-        assert_eq!(simple_cache.lru_cache.len(), 1);
+        assert_eq!(simple_cache.len(), 1);
     }
 
     #[rstest]
-    fn get_value(mut simple_cache: Cache<i32, i32>) {
+    fn get_value(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key = 1;
         let value = 2;
@@ -217,11 +231,11 @@ mod tests {
         simple_cache.insert(&key, &value);
 
         // Assert
-        assert_eq!(simple_cache.get(&key), Some(&value));
+        assert_eq!(simple_cache.get(&key), Some(value));
     }
 
     #[rstest]
-    fn get_value_not_found(mut simple_cache: Cache<i32, i32>) {
+    fn get_value_not_found(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key = 1;
 
@@ -230,7 +244,7 @@ mod tests {
     }
 
     #[rstest]
-    fn insert_max_capacity(mut simple_cache: Cache<i32, i32>) {
+    fn insert_max_capacity(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key1 = 1;
         let key2 = 2;
@@ -245,12 +259,12 @@ mod tests {
         simple_cache.insert(&key4, &value);
 
         // Assert
-        assert_eq!(simple_cache.lru_cache.len(), 3);
+        assert_eq!(simple_cache.len(), 3);
         assert_eq!(simple_cache.get(&key1), None); // lru is removed
     }
 
     #[rstest]
-    fn get_lru_change(mut simple_cache: Cache<i32, i32>) {
+    fn get_lru_change(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key1 = 1;
         let key2 = 2;
@@ -266,12 +280,12 @@ mod tests {
         simple_cache.insert(&key4, &value);
 
         // Assert
-        assert_eq!(simple_cache.lru_cache.len(), 3);
+        assert_eq!(simple_cache.len(), 3);
         assert_eq!(simple_cache.get(&key2), None); // lru is removed
     }
 
     #[rstest]
-    fn ttl_expired(mut simple_cache: Cache<i32, i32>) {
+    fn ttl_expired(simple_cache: Cache<i32, i32>) {
         // Arrange
         let key = 1;
         let value = 2;
@@ -285,7 +299,7 @@ mod tests {
     }
 
     #[rstest]
-    fn retrieve_or_compute_not_in_cache(mut simple_cache: Cache<i32, i32>){
+    fn retrieve_or_compute_not_in_cache(simple_cache: Cache<i32, i32>){
         // Arrange
         let key = 1;
 
@@ -299,7 +313,7 @@ mod tests {
     }
 
     #[rstest]
-    fn retrieve_or_compute_already_in_cache(mut simple_cache: Cache<i32, i32>){
+    fn retrieve_or_compute_already_in_cache(simple_cache: Cache<i32, i32>){
         // Arrange
         let key = 1;
 
@@ -317,63 +331,65 @@ mod tests {
     }
 
     #[rstest]
-    fn retrieve_or_compute_ttl_expired(mut simple_cache: Cache<i32, i32>){
+    fn retrieve_or_compute_ttl_expired(simple_cache: Cache<i32, i32>){
         // Arrange
         let key = 1;
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.peek(&key).unwrap().clone();
-        std::thread::sleep(std::time::Duration::from_millis(105));
-        simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.peek(&key).unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(100));
         simple_cache.retrieve_or_compute(&key);
-        let entry_3 = simple_cache.lru_cache.peek(&key).unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        simple_cache.retrieve_or_compute(&key);
+        let entry_3 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
         
         // Assert
         assert_eq!(entry_1.status, EntryStatus::READY);
         assert_eq!(entry_1, entry_2); // not expired
-        assert_ne!(entry_1.expiration, entry_3.expiration); // expired 
+        assert_ne!(entry_1, entry_3); // expired 
     }
 
     #[rstest]
-    fn retrieve_or_compute_negative_ttl(mut simple_cache: Cache<i32, i32>){
+    fn retrieve_or_compute_negative_ttl(simple_cache: Cache<i32, i32>){
         // Arrange
         let key = -1;
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.peek(&key).unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.peek(&key).unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
         
         // Assert
         assert_ne!(entry_1, entry_2); // expired because negative ttl is lower
         assert_eq!(entry_1.status, EntryStatus::FAILED);
     }
 
-    // #[rstest]
-    // fn test_thread_safe_cache(mut simple_cache: Cache<i32, i32>) {
-    //     let cache = Arc::new(simple_cache);
+    #[rstest]
+    fn test_thread_safe_cache(simple_cache: Cache<i32, i32>) {
+        // Arrange
+        let cache = Arc::new(simple_cache);
+        // Act
+        let handles: Vec<_> = (0..10).map(|_| {
+            let cache_clone = Arc::clone(&cache);
+            thread::spawn(move || {
+                let key = 456;
+                cache_clone.retrieve_or_compute(&key);
+            })
+        }).collect();
 
-    //     let handles: Vec<_> = (0..10).map(|_| {
-    //         let cache_clone = Arc::clone(&cache);
-    //         thread::spawn(move || {
-    //             let key = 456;
-    //             let res = cache_clone.retrieve_or_compute(&key).clone();
-    //             res
-    //         })
-    //     }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
 
-    //     let results = handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>();
-
-    //     // Additional checks to ensure all keys are present
-    //     for _ in 0..10 {
-    //         let key = 456;
-    //         assert_eq!(cache.get(&key), Some(results[0].0));
-    //     }
-    // }
+        // Assert
+        let key = 456;
+        let (data, code) = cache.retrieve_or_compute(&key);
+        assert_eq!(*data, key * 2);
+        assert_eq!(code, 1);
+    }
 
 }
