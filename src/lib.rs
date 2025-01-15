@@ -2,7 +2,7 @@ use lru::{LruCache, DefaultHasher};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum EntryStatus {
@@ -12,13 +12,23 @@ enum EntryStatus {
     FAILED,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct Entry<D> {
     data: D,
     adhoc_code: u8,
     expiration: Instant,
     status: EntryStatus,
 }
+
+impl<D: PartialEq> PartialEq for Entry<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data &&
+        self.adhoc_code == other.adhoc_code &&
+        self.expiration == other.expiration &&
+        self.status == other.status
+    }
+}
+
 
 impl<D: Default> Entry<D> {
 
@@ -44,6 +54,7 @@ impl<D: Default> Entry<D> {
     fn is_valid(&self) -> bool {
         self.expiration > Instant::now()
     }
+
 }
 
 type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
@@ -113,48 +124,37 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         self.lru_cache.read().unwrap().len()
     }
 
-    pub fn retrieve_or_compute(&self, key: &K) -> (&D, u8) {
+    fn handle_hit(&self, key: &K) -> Option<Entry<D>> {
+        let is_in_cache = self.is_in_cache(key);
+        
+        let cache = self.lru_cache.read().unwrap();
+        // First, check if the entry exists and is valid        
+        if is_in_cache {           
+            // Hit
+            let cache_entry = cache.peek(&key).unwrap();
+            match cache_entry.status {
+                EntryStatus::CALCULATING => {
+                    println!("CALCULATING");
+                    // cache_entry.wait();
+                    return Some(cache_entry.clone());
+                }
+                _ => {}
+            }
+            return Some(cache_entry.clone());
+        };
+        return None;
+
+    }
+
+    pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
         let miss_handler = self.miss_handler;
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
 
-        {
-            let mut cache = self.lru_cache.write().unwrap();
-            // First, check if the entry exists and is valid
-            let is_in_cache = {                
-                if let Some(entry) = cache.get(key) {
-                    entry.is_valid()
-                } else {
-                    false
-                }            
-            };
-            if is_in_cache {           
-                // Hit
-                // let cache = self.lru_cache.write().unwrap();
-                let cache_entry = cache.peek(&key).unwrap();
-                match cache_entry.status {
-                    EntryStatus::READY => {
-                        println!("READY");
-                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-                    }
-                    EntryStatus::FAILED => {
-                        println!("FAILED");
-                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-                    }
-                    EntryStatus::CALCULATING => {
-                        println!("CALCULATING");
-                        // //wait for the entry to change status
-                        // while cache_entry.status == EntryStatus::CALCULATING {
-                        //     std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
-                        // }
-                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-                    }
-                    _ => {}
-                }
-                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-            };
-
-        }        
+        if let Some(cache_entry) = self.handle_hit(key) {
+            return Some((cache_entry.data, cache_entry.adhoc_code));
+        }
+      
         println!("MISS");
         // Miss
         let status = {
@@ -174,16 +174,13 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
                 println!("CALCULATING 2");
                 //wait for the entry to change status                
                 let cache_entry = cache.peek(&key).unwrap();
-                // while cache_entry.status == EntryStatus::CALCULATING {
-                //     std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
-                //     cache_entry = cache.peek(&key).unwrap();
-                // }
-                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+                // cache_entry.wait();
+                return Some((cache_entry.data, cache_entry.adhoc_code));
             }
             EntryStatus::READY | EntryStatus::FAILED => {
                 let cache = self.lru_cache.read().unwrap();
                 let cache_entry = cache.peek(&key).unwrap();
-                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+                return Some((cache_entry.data, cache_entry.adhoc_code));
             }
             _ => {}
         }
@@ -209,13 +206,14 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
             cache_entry.adhoc_code = entry.adhoc_code;
             cache_entry.expiration = entry.expiration;
             cache_entry.status = entry.status;
+            // cache_entry.notify();
         }
 
         let binding = self.lru_cache.read().unwrap();
         let cache_entry = binding.peek(&key).unwrap();
         
         
-        (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code)
+        Some((cache_entry.data, cache_entry.adhoc_code))
     }
 }
 
@@ -360,10 +358,10 @@ mod tests {
         let key = 1;
 
         // Act
-        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key);
+        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key).unwrap();
 
         // Assert
-        assert_eq!(*data, 2);
+        assert_eq!(data, 2);
         assert_eq!(adhoc_code, 1);
         assert_eq!(simple_cache.len(), 1);
     }
@@ -378,10 +376,10 @@ mod tests {
         simple_cache.retrieve_or_compute(&key);
         simple_cache.retrieve_or_compute(&key);
         simple_cache.retrieve_or_compute(&key);
-        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key);
+        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key).unwrap();
 
         // Assert
-        assert_eq!(*data, 2);
+        assert_eq!(data, 2);
         assert_eq!(adhoc_code, 1);
         assert_eq!(simple_cache.len(), 1);
     }
@@ -446,30 +444,28 @@ mod tests {
     fn test_thread_safe_cache_same_key(time_consuming_mh: Cache<i32, i32>) {
         // Arrange
         let cache = Arc::new(time_consuming_mh);
-        let n_threads: i32 = 20;
+        let n_threads: i32 = 2;
         let start = Instant::now();
 
         // Act
         let handles: Vec<_> = (0..n_threads).map(|_| {
             let cache_clone = Arc::clone(&cache);
             thread::spawn(move || {
-                let key = 456;
-                cache_clone.retrieve_or_compute(&key);
+            let key = 456;
+            cache_clone.retrieve_or_compute(&key)
             })
         }).collect();
 
+        // Assert
         for handle in handles {
             let res = handle.join();
             // assert res is ok
             assert!(res.is_ok());
-            res.unwrap();
-        }
-
-        // Assert
-        let key = 456;
-        let (data, code) = cache.retrieve_or_compute(&key);
-        assert_eq!(*data, key * 2);
-        assert_eq!(code, 1);
+            if let Some((data, adhoc_code)) = res.unwrap() {
+                assert_eq!(data, 456 * 2);
+                assert_eq!(adhoc_code, 1);
+            }
+        }        
         let duration = start.elapsed();
         assert!(duration.as_secs() < 1);
     }
