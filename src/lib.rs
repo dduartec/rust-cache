@@ -60,7 +60,7 @@ impl<D: Default> Entry<D> {
 type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
 
 pub struct Cache<K, D> {
-    lru_cache: Arc<RwLock<LruCache<K, Entry<D>>>>,
+    lru_cache: Arc<RwLock<LruCache<K, Arc<Mutex<Entry<D>>>>>>,
     miss_handler: MissHandler<K, D>,
     positive_ttl: Duration, // seconds
     negative_ttl: Duration, // seconds
@@ -88,14 +88,16 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
     pub fn insert(&self, key: &K, data: &D) {
         let expiration = Instant::now() + self.positive_ttl;
         let entry = Entry::new(*data, expiration, 0);
-        self.lru_cache.write().unwrap().put(*key, entry);        
+        let entry_arc = Arc::new(Mutex::new(entry));
+        self.lru_cache.write().unwrap().put(*key, entry_arc);        
     }
 
     pub fn get(&self, key: &K) -> Option<D> {
         if self.is_in_cache(key) {
             let cache = self.lru_cache.read().unwrap();
-            let cache_entry = cache.peek(&key).unwrap();
-            return Some(unsafe { *(&cache_entry.data as *const D) });
+            let cache_entry_arc = cache.peek(&key).unwrap();
+            let cache_entry = cache_entry_arc.lock().unwrap();
+            return Some(cache_entry.data);
         }
         None
     }
@@ -104,8 +106,8 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         // First, check if the entry exists and is valid
         let is_in_cache = {
             let mut cache = self.lru_cache.write().unwrap();
-            if let Some(entry) = cache.get(key) {
-                entry.is_valid()
+            if let Some(entry_arc) = cache.get(key) {
+                entry_arc.lock().unwrap().is_valid()
             } else {
                 false
             }            
@@ -131,7 +133,8 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         // First, check if the entry exists and is valid        
         if is_in_cache {           
             // Hit
-            let cache_entry = cache.peek(&key).unwrap();
+            let cache_entry_arc = cache.peek(&key).unwrap();
+            let cache_entry = cache_entry_arc.lock().unwrap();
             match cache_entry.status {
                 EntryStatus::CALCULATING => {
                     println!("CALCULATING");
@@ -159,7 +162,8 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         // Miss
         let status = {
             let mut binding = self.lru_cache.write().unwrap();
-            let cache_entry = binding.get_or_insert_mut(*key, || Entry::default());
+            let cache_entry_arc = binding.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
+            let mut cache_entry = cache_entry_arc.lock().unwrap();
             if cache_entry.status == EntryStatus::AVAILABLE {
                 cache_entry.status = EntryStatus::CALCULATING;
                 EntryStatus::AVAILABLE
@@ -173,13 +177,15 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
                 let cache = self.lru_cache.read().unwrap();
                 println!("CALCULATING 2");
                 //wait for the entry to change status                
-                let cache_entry = cache.peek(&key).unwrap();
+                let cache_entry_arc = cache.peek(&key).unwrap();
+                let cache_entry = cache_entry_arc.lock().unwrap();
                 // cache_entry.wait();
                 return Some((cache_entry.data, cache_entry.adhoc_code));
             }
             EntryStatus::READY | EntryStatus::FAILED => {
                 let cache = self.lru_cache.read().unwrap();
-                let cache_entry = cache.peek(&key).unwrap();
+                let cache_entry_arc = cache.peek(&key).unwrap();
+                let cache_entry = cache_entry_arc.lock().unwrap();
                 return Some((cache_entry.data, cache_entry.adhoc_code));
             }
             _ => {}
@@ -199,8 +205,9 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
 
 
         {
-            let mut cache = self.lru_cache.write().unwrap();
-            let cache_entry = cache.peek_mut(key).unwrap();
+            let cache = self.lru_cache.write().unwrap();
+            let cache_entry_arc = cache.peek(&key).unwrap();
+            let mut cache_entry = cache_entry_arc.lock().unwrap();
 
             cache_entry.data = entry.data;
             cache_entry.adhoc_code = entry.adhoc_code;
@@ -210,7 +217,8 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         }
 
         let binding = self.lru_cache.read().unwrap();
-        let cache_entry = binding.peek(&key).unwrap();
+        let cache_entry_arc = binding.peek(&key).unwrap();
+        let cache_entry = cache_entry_arc.lock().unwrap();
         
         
         Some((cache_entry.data, cache_entry.adhoc_code))
@@ -388,16 +396,15 @@ mod tests {
     fn retrieve_or_compute_ttl_expired(simple_cache: Cache<i32, i32>){
         // Arrange
         let key = 1;
-
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(100));
         simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(150));
         simple_cache.retrieve_or_compute(&key);
-        let entry_3 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        let entry_3 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         
         // Assert
         assert_eq!(entry_1.status, EntryStatus::READY);
@@ -412,10 +419,10 @@ mod tests {
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         
         // Assert
         assert_ne!(entry_1, entry_2); // expired because negative ttl is lower
