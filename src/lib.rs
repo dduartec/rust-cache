@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum EntryStatus {
     AVAILABLE,
     CALCULATING,
@@ -81,11 +81,13 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
     }
 
     pub fn get(&self, key: &K) -> Option<D> {
-            if self.is_in_cache(key) {
-                return self.lru_cache.write().unwrap().get(key).map(|entry| entry.data.clone());
-            }
-            None
+        if self.is_in_cache(key) {
+            let cache = self.lru_cache.read().unwrap();
+            let cache_entry = cache.peek(&key).unwrap();
+            return Some(unsafe { *(&cache_entry.data as *const D) });
         }
+        None
+    }
 
     fn is_in_cache(&self, key: &K) -> bool {
         // First, check if the entry exists and is valid
@@ -115,33 +117,81 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         let miss_handler = self.miss_handler;
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
-        
-        if self.is_in_cache(key) {
-            // Hit
-            let cache = self.lru_cache.read().unwrap();
-            let cache_entry = cache.peek(&key).unwrap();
-            match cache_entry.status {
-                EntryStatus::READY => {
-                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-                }
-                EntryStatus::FAILED => {
-                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-                }
-                EntryStatus::CALCULATING => {
-                    //wait for the entry to change status
-                    while cache_entry.status == EntryStatus::CALCULATING {
-                        std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
+
+        {
+            let mut cache = self.lru_cache.write().unwrap();
+            // First, check if the entry exists and is valid
+            let is_in_cache = {                
+                if let Some(entry) = cache.get(key) {
+                    entry.is_valid()
+                } else {
+                    false
+                }            
+            };
+            if is_in_cache {           
+                // Hit
+                // let cache = self.lru_cache.write().unwrap();
+                let cache_entry = cache.peek(&key).unwrap();
+                match cache_entry.status {
+                    EntryStatus::READY => {
+                        println!("READY");
+                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
                     }
-                    return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+                    EntryStatus::FAILED => {
+                        println!("FAILED");
+                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+                    }
+                    EntryStatus::CALCULATING => {
+                        println!("CALCULATING");
+                        // //wait for the entry to change status
+                        // while cache_entry.status == EntryStatus::CALCULATING {
+                        //     std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
+                        // }
+                        return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
-        }      
-    
+                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+            };
+
+        }        
+        println!("MISS");
         // Miss
-        let mut entry: Entry<D> = Entry::default();
-        entry.status = EntryStatus::CALCULATING;
+        let status = {
+            let mut binding = self.lru_cache.write().unwrap();
+            let cache_entry = binding.get_or_insert_mut(*key, || Entry::default());
+            if cache_entry.status == EntryStatus::AVAILABLE {
+                cache_entry.status = EntryStatus::CALCULATING;
+                EntryStatus::AVAILABLE
+            } else {
+                cache_entry.status
+            }
+        };
+
+        match status {
+            EntryStatus::CALCULATING => {
+                let cache = self.lru_cache.read().unwrap();
+                println!("CALCULATING 2");
+                //wait for the entry to change status                
+                let cache_entry = cache.peek(&key).unwrap();
+                // while cache_entry.status == EntryStatus::CALCULATING {
+                //     std::thread::sleep(std::time::Duration::from_millis(10)); // TODO: replace with a condition variable
+                //     cache_entry = cache.peek(&key).unwrap();
+                // }
+                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+            }
+            EntryStatus::READY | EntryStatus::FAILED => {
+                let cache = self.lru_cache.read().unwrap();
+                let cache_entry = cache.peek(&key).unwrap();
+                return (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code);
+            }
+            _ => {}
+        }
+
+        
+
+        let entry = Entry::default();
+        let mut entry = Entry::new(entry.data, Instant::now(), entry.adhoc_code);
         if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
             entry.expiration = Instant::now() + positive_ttl;
             entry.status = EntryStatus::READY;
@@ -149,12 +199,23 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
             entry.expiration = Instant::now() + negative_ttl;
             entry.status = EntryStatus::FAILED;
         }
-    
-        // Insert new entry
-        let mut binding = self.lru_cache.write().unwrap();
-        let cache_entry = binding.get_or_insert_mut(*key, || entry);
-        (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code)
 
+
+        {
+            let mut cache = self.lru_cache.write().unwrap();
+            let cache_entry = cache.peek_mut(key).unwrap();
+
+            cache_entry.data = entry.data;
+            cache_entry.adhoc_code = entry.adhoc_code;
+            cache_entry.expiration = entry.expiration;
+            cache_entry.status = entry.status;
+        }
+
+        let binding = self.lru_cache.read().unwrap();
+        let cache_entry = binding.peek(&key).unwrap();
+        
+        
+        (unsafe { &*(&cache_entry.data as *const D) }, cache_entry.adhoc_code)
     }
 }
 
@@ -177,11 +238,6 @@ mod tests {
             if *key == -1 {
                 return false
             }
-            // take computing time if key is 456:
-            if *key == 456 {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-            }
-
             *data = key * 2;
             *adhoc_code += 1; // should always be 1
             true
@@ -368,12 +424,33 @@ mod tests {
         assert_eq!(entry_1.status, EntryStatus::FAILED);
     }
 
+    #[fixture]
+    fn time_consuming_mh() -> Cache<i32, i32> {
+        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8) -> bool {
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            *data = key * 2;
+            *adhoc_code += 1; // should always be 1
+            true
+        }
+        Cache::new(
+            20,
+            miss_handler,
+            Duration::from_secs(60),          
+            Duration::from_secs(60),          
+        )
+    }
+
     #[rstest]
-    fn test_thread_safe_cache(simple_cache: Cache<i32, i32>) {
+    fn test_thread_safe_cache_same_key(time_consuming_mh: Cache<i32, i32>) {
         // Arrange
-        let cache = Arc::new(simple_cache);
+        let cache = Arc::new(time_consuming_mh);
+        let n_threads: i32 = 20;
+        let start = Instant::now();
+
         // Act
-        let handles: Vec<_> = (0..10).map(|_| {
+        let handles: Vec<_> = (0..n_threads).map(|_| {
             let cache_clone = Arc::clone(&cache);
             thread::spawn(move || {
                 let key = 456;
@@ -382,7 +459,10 @@ mod tests {
         }).collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            let res = handle.join();
+            // assert res is ok
+            assert!(res.is_ok());
+            res.unwrap();
         }
 
         // Assert
@@ -390,6 +470,82 @@ mod tests {
         let (data, code) = cache.retrieve_or_compute(&key);
         assert_eq!(*data, key * 2);
         assert_eq!(code, 1);
+        let duration = start.elapsed();
+        assert!(duration.as_secs() < 1);
+    }
+
+    #[rstest]
+    fn test_thread_safe_cache_different_keys(time_consuming_mh: Cache<i32, i32>) {
+        // Arrange
+        let cache = Arc::new(time_consuming_mh);
+        let n_threads = 20;
+        let start = Instant::now();
+
+        // Act
+        let handles: Vec<_> = (0..n_threads).map(|i| {
+            let cache_clone = Arc::clone(&cache);
+            thread::spawn(move || {
+                let key = 456 + i;
+                cache_clone.retrieve_or_compute(&key);
+            })
+        }).collect();
+
+        for handle in handles {
+            let res = handle.join();
+            // assert res is ok
+            assert!(res.is_ok());
+            res.unwrap();
+        }
+
+        // Assert        
+        for i in 0..n_threads {
+            let key = 456 + i;
+            let data = cache.get(&key);
+            assert_eq!(data, Some(key * 2));
+        }
+        let duration = start.elapsed();
+        assert!(duration.as_secs() < 1);
+    }
+
+    #[rstest]
+    fn test_thread_safe_cache_maximum_capacity(time_consuming_mh: Cache<i32, i32>) {
+        // Arrange
+        let cache = Arc::new(time_consuming_mh);
+        let n_threads = 22;
+        let start = Instant::now();
+
+        // Act
+        let handles: Vec<_> = (0..n_threads).map(|i| {
+            let cache_clone = Arc::clone(&cache);
+            thread::spawn(move || {
+                let key = 456 + i;
+                cache_clone.retrieve_or_compute(&key);
+            })
+        }).collect();
+
+        for handle in handles {
+            let res = handle.join();
+            // assert res is ok
+            assert!(res.is_ok());
+            res.unwrap();
+        }
+
+        // Assert
+        let mut not_in_cache_count = 0;      
+        for i in 0..n_threads {
+            let key = 456 + i;
+            let data = cache.get(&key);
+            if data == None {
+                not_in_cache_count += 1;
+            } else {
+                let key = 456 + i;
+                let data = cache.get(&key);
+                assert_eq!(data, Some(key * 2));
+            }
+        }
+        let duration = start.elapsed();
+        assert!(duration.as_secs() < 1);
+        assert_eq!(not_in_cache_count, 2);
     }
 
 }
