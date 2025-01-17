@@ -61,10 +61,10 @@ impl<D: Default> Entry<D> {
 
 }
 
-type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
+pub type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
 
 pub struct Cache<K, D> {
-    lru_cache: Arc<RwLock<LruCache<K, Arc<Mutex<Entry<D>>>>>>,
+    lru_cache: Arc<Mutex<LruCache<K, Arc<Mutex<Entry<D>>>>>>,
     miss_handler: MissHandler<K, D>,
     positive_ttl: Duration, // seconds
     negative_ttl: Duration, // seconds
@@ -79,7 +79,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
     ) -> Self {
         let hash_builder = DefaultHasher::default();
         Cache {
-            lru_cache: Arc::new(RwLock::new(LruCache::with_hasher(
+            lru_cache: Arc::new(Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(size).unwrap(),
                 hash_builder,
             ))),
@@ -93,7 +93,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
         let expiration = Instant::now() + self.positive_ttl;
         let entry = Entry::new(data, expiration, 0);
         let entry_arc = Arc::new(Mutex::new(entry));
-        self.lru_cache.write().unwrap().put(key.clone(), entry_arc);        
+        self.lru_cache.lock().unwrap().put(key.clone(), entry_arc);     
     }
 
     pub fn get(&self, key: &K) -> Option<D> {
@@ -106,7 +106,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
 
     fn get_entry(&self, key: &K) -> Option<Arc<Mutex<Entry<D>>>> {
         // lock the cache
-        let mut cache = self.lru_cache.write().unwrap();
+        let mut cache = self.lru_cache.lock().unwrap();
         // check if the entry exists and is valid
         if let Some(entry_arc) = cache.get(key) {
             let entry = entry_arc.lock().unwrap();
@@ -120,7 +120,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
     }
 
     pub fn len(&self) -> usize {
-        self.lru_cache.read().unwrap().len()
+        self.lru_cache.lock().unwrap().len()
     }
 
     fn handle_hit(&self, key: &K) -> Option<(D, u8)> {
@@ -165,32 +165,32 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
 
         // Miss
         let entry_arc = {
-            let mut locked_cache = self.lru_cache.write().unwrap();
+            let mut locked_cache = self.lru_cache.lock().unwrap();
             let entry_arc = locked_cache.get_or_insert_mut(key.clone(), || Arc::new(Mutex::new(Entry::default())));
             Arc::clone(&entry_arc)
         };
 
         let mut locked_entry = entry_arc.lock().unwrap();
         let entry_arc_clone = Arc::clone(&entry_arc);
-        let entry = locked_entry.deref_mut();
+        let locked_entry = locked_entry.deref_mut();
 
-        match entry.status {
+        match locked_entry.status {
             EntryStatus::AVAILABLE => {
                 {
-                    entry.status = EntryStatus::CALCULATING;                   
-                    if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
-                        entry.expiration = Instant::now() + positive_ttl;
-                        entry.status = EntryStatus::READY;
+                    locked_entry.status = EntryStatus::CALCULATING;
+                    if miss_handler(&key, &mut locked_entry.data, &mut locked_entry.adhoc_code) {
+                        locked_entry.expiration = Instant::now() + positive_ttl;
+                        locked_entry.status = EntryStatus::READY;
                     } else {
-                        entry.expiration = Instant::now() + negative_ttl;
-                        entry.status = EntryStatus::FAILED;
+                        locked_entry.expiration = Instant::now() + negative_ttl;
+                        locked_entry.status = EntryStatus::FAILED;
                     }
                 }
-                entry.cond_var.notify_all();
+                locked_entry.cond_var.notify_all();
             }
             EntryStatus::CALCULATING => {
                 println!("CALCULATING");
-                match entry.cond_var.wait_while(
+                match locked_entry.cond_var.wait_while(
                     entry_arc_clone.lock().unwrap(), 
                     |entry: &mut Entry<D>| entry.status == EntryStatus::CALCULATING)
                     {
@@ -205,7 +205,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
         }
         
         
-        Some((entry.data.clone(), entry.adhoc_code))
+        Some((locked_entry.data.clone(), locked_entry.adhoc_code))
     }
 }
 
@@ -382,13 +382,13 @@ mod tests {
         let key = 1;
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.lock().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(100));
         simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.lock().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(150));
         simple_cache.retrieve_or_compute(&key);
-        let entry_3 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
+        let entry_3 = simple_cache.lru_cache.lock().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         
         // Assert
         assert_eq!(entry_1.status, EntryStatus::READY);
@@ -403,10 +403,10 @@ mod tests {
 
         // Act
         simple_cache.retrieve_or_compute(&key);
-        let entry_1 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
+        let entry_1 = simple_cache.lru_cache.lock().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         std::thread::sleep(std::time::Duration::from_millis(105));
         simple_cache.retrieve_or_compute(&key);
-        let entry_2 = simple_cache.lru_cache.read().unwrap().peek(&key).unwrap().lock().unwrap().clone();
+        let entry_2 = simple_cache.lru_cache.lock().unwrap().peek(&key).unwrap().lock().unwrap().clone();
         
         // Assert
         assert_ne!(entry_1, entry_2); // expired because negative ttl is lower
@@ -542,7 +542,7 @@ mod tests {
     #[rstest]
     fn test_thread_safe_heavy_threads(time_consuming_mh: Cache<i32, i32>) {
         let cache = Arc::new(time_consuming_mh);
-        for _ in 0..50 {            
+        for _ in 0..50 {
             // Arrange
             let n_keys = 5;
             let entries_per_key = 20;
