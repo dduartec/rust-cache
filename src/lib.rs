@@ -1,6 +1,7 @@
 use lru::{LruCache, DefaultHasher};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
+use std::ops::DerefMut;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -18,6 +19,7 @@ struct Entry<D> {
     adhoc_code: u8,
     expiration: Instant,
     status: EntryStatus,
+    cond_var: Arc<Condvar>
 }
 
 impl<D: PartialEq> PartialEq for Entry<D> {
@@ -38,6 +40,7 @@ impl<D: Default> Entry<D> {
             expiration: Instant::now(),
             adhoc_code: 0,
             status: EntryStatus::AVAILABLE,
+            cond_var: Arc::new(Condvar::new())
         }
     }
 
@@ -48,6 +51,7 @@ impl<D: Default> Entry<D> {
             expiration,
             adhoc_code,
             status: EntryStatus::AVAILABLE,
+            cond_var: Arc::new(Condvar::new())
         }
     }
 
@@ -157,68 +161,52 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         if let Some(cache_entry) = self.handle_hit(key) {
             return Some((cache_entry.data, cache_entry.adhoc_code));
         }
-      
-        println!("MISS");
+
         // Miss
-        let status = {
-            let mut binding = self.lru_cache.write().unwrap();
-            let cache_entry_arc = binding.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
-            let mut cache_entry = cache_entry_arc.lock().unwrap();
-            if cache_entry.status == EntryStatus::AVAILABLE {
-                cache_entry.status = EntryStatus::CALCULATING;
-                EntryStatus::AVAILABLE
-            } else {
-                cache_entry.status
-            }
+        let cache_entry_arc = {
+            let mut locked_cache = self.lru_cache.write().unwrap();
+            let cache_entry_arc = locked_cache.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
+            Arc::clone(&cache_entry_arc)
         };
 
-        match status {
+        let mut locked_cache_entry = cache_entry_arc.lock().unwrap();
+        let cache_entry_arc_clone = Arc::clone(&cache_entry_arc);
+        let cache_entry = locked_cache_entry.deref_mut();
+
+        match cache_entry.status {
+            EntryStatus::AVAILABLE => {
+                {
+                    cache_entry.status = EntryStatus::CALCULATING;                   
+                    if miss_handler(&key, &mut cache_entry.data, &mut cache_entry.adhoc_code) {
+                        cache_entry.expiration = Instant::now() + positive_ttl;
+                        cache_entry.status = EntryStatus::READY;
+                    } else {
+                        cache_entry.expiration = Instant::now() + negative_ttl;
+                        cache_entry.status = EntryStatus::FAILED;
+                    }
+                }
+                cache_entry.cond_var.notify_all();
+            }
             EntryStatus::CALCULATING => {
-                let cache = self.lru_cache.read().unwrap();
-                println!("CALCULATING 2");
-                //wait for the entry to change status                
-                let cache_entry_arc = cache.peek(&key).unwrap();
-                let cache_entry = cache_entry_arc.lock().unwrap();
-                // cache_entry.wait();
-                return Some((cache_entry.data, cache_entry.adhoc_code));
+                println!("CALCULATING");
+                match cache_entry.cond_var.wait_while(
+                    cache_entry_arc_clone.lock().unwrap(), 
+                    |entry: &mut Entry<D>| entry.status == EntryStatus::CALCULATING)
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("Error while waiting: {:?}", e);
+                        }
+                    }
             }
-            EntryStatus::READY | EntryStatus::FAILED => {
-                let cache = self.lru_cache.read().unwrap();
-                let cache_entry_arc = cache.peek(&key).unwrap();
-                let cache_entry = cache_entry_arc.lock().unwrap();
-                return Some((cache_entry.data, cache_entry.adhoc_code));
+            // _ => {}
+            EntryStatus::READY => {
+                println!("READY");
             }
-            _ => {}
+            EntryStatus::FAILED => {
+                println!("FAILED");
+            }
         }
-
-        
-
-        let entry = Entry::default();
-        let mut entry = Entry::new(entry.data, Instant::now(), entry.adhoc_code);
-        if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
-            entry.expiration = Instant::now() + positive_ttl;
-            entry.status = EntryStatus::READY;
-        } else {
-            entry.expiration = Instant::now() + negative_ttl;
-            entry.status = EntryStatus::FAILED;
-        }
-
-
-        {
-            let cache = self.lru_cache.write().unwrap();
-            let cache_entry_arc = cache.peek(&key).unwrap();
-            let mut cache_entry = cache_entry_arc.lock().unwrap();
-
-            cache_entry.data = entry.data;
-            cache_entry.adhoc_code = entry.adhoc_code;
-            cache_entry.expiration = entry.expiration;
-            cache_entry.status = entry.status;
-            // cache_entry.notify();
-        }
-
-        let binding = self.lru_cache.read().unwrap();
-        let cache_entry_arc = binding.peek(&key).unwrap();
-        let cache_entry = cache_entry_arc.lock().unwrap();
         
         
         Some((cache_entry.data, cache_entry.adhoc_code))
@@ -440,7 +428,7 @@ mod tests {
             true
         }
         Cache::new(
-            20,
+            200,
             miss_handler,
             Duration::from_secs(60),          
             Duration::from_secs(60),          
@@ -448,24 +436,24 @@ mod tests {
     }
 
     #[rstest]
-    fn test_thread_safe_cache_same_key(time_consuming_mh: Cache<i32, i32>) {
-        // Arrange
+    fn test_thread_safe_cache_same_key(time_consuming_mh: Cache<i32, i32>) {        
+        // Arrange            
         let cache = Arc::new(time_consuming_mh);
-        let n_threads: i32 = 2;
+        let n_threads: i32 = 200;
         let start = Instant::now();
 
         // Act
-        let handles: Vec<_> = (0..n_threads).map(|_| {
+        let handles: Vec<_> = (0..n_threads).map(|i| {
             let cache_clone = Arc::clone(&cache);
-            thread::spawn(move || {
+            thread::Builder::new().name(format!("Thread {}", i)).spawn(move || {
             let key = 456;
             cache_clone.retrieve_or_compute(&key)
             })
         }).collect();
 
         // Assert
-        for handle in handles {
-            let res = handle.join();
+        let results = handles.into_iter().map(|handle| handle.unwrap().join());
+        for res in results {
             // assert res is ok
             assert!(res.is_ok());
             if let Some((data, adhoc_code)) = res.unwrap() {
@@ -474,7 +462,9 @@ mod tests {
             }
         }        
         let duration = start.elapsed();
+        assert!(cache.len() == 1);
         assert!(duration.as_secs() < 1);
+        
     }
 
     #[rstest]
@@ -506,6 +496,7 @@ mod tests {
             let data = cache.get(&key);
             assert_eq!(data, Some(key * 2));
         }
+        assert!(cache.len() == n_threads.try_into().unwrap());
         let duration = start.elapsed();
         assert!(duration.as_secs() < 1);
     }
@@ -514,7 +505,7 @@ mod tests {
     fn test_thread_safe_cache_maximum_capacity(time_consuming_mh: Cache<i32, i32>) {
         // Arrange
         let cache = Arc::new(time_consuming_mh);
-        let n_threads = 22;
+        let n_threads = 202;
         let start = Instant::now();
 
         // Act
@@ -547,6 +538,7 @@ mod tests {
             }
         }
         let duration = start.elapsed();
+        assert!(cache.len() == 200);
         assert!(duration.as_secs() < 1);
         assert_eq!(not_in_cache_count, 2);
     }
