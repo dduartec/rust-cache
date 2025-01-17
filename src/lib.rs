@@ -97,60 +97,61 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
     }
 
     pub fn get(&self, key: &K) -> Option<D> {
-        if self.is_in_cache(key) {
-            let cache = self.lru_cache.read().unwrap();
-            let cache_entry_arc = cache.peek(&key).unwrap();
-            let cache_entry = cache_entry_arc.lock().unwrap();
-            return Some(cache_entry.data);
+        if let Some(entry_arc) = self.get_entry(key) {
+            let entry = entry_arc.lock().unwrap();
+            return Some(entry.data);
         }
         None
     }
 
-    fn is_in_cache(&self, key: &K) -> bool {
-        // First, check if the entry exists and is valid
-        let is_in_cache = {
-            let mut cache = self.lru_cache.write().unwrap();
-            if let Some(entry_arc) = cache.get(key) {
-                entry_arc.lock().unwrap().is_valid()
-            } else {
-                false
-            }            
-        };
-
-        if is_in_cache {
-            return true;
+    fn get_entry(&self, key: &K) -> Option<Arc<Mutex<Entry<D>>>> {
+        // lock the cache
+        let mut cache = self.lru_cache.write().unwrap();
+        // check if the entry exists and is valid
+        if let Some(entry_arc) = cache.get(key) {
+            let entry = entry_arc.lock().unwrap();
+            if entry.is_valid() {
+                return Some(Arc::clone(&entry_arc));
+            }
         }
-
-        // If the entry is expired, remove it
-        self.lru_cache.write().unwrap().pop(key);
-        false
+        // if the entry is not valid or does not exist, remove it
+        cache.pop(key);
+        None
     }
 
     pub fn len(&self) -> usize {
         self.lru_cache.read().unwrap().len()
     }
 
-    fn handle_hit(&self, key: &K) -> Option<Entry<D>> {
-        let is_in_cache = self.is_in_cache(key);
-        
-        let cache = self.lru_cache.read().unwrap();
-        // First, check if the entry exists and is valid        
-        if is_in_cache {           
-            // Hit
-            let cache_entry_arc = cache.peek(&key).unwrap();
-            let cache_entry = cache_entry_arc.lock().unwrap();
-            match cache_entry.status {
+    fn handle_hit(&self, key: &K) -> Option<(D, u8)> {
+        // check if the the entry exists and is valid
+        if let Some(entry_arc) = self.get_entry(key) {
+            let entry_arc_clone = Arc::clone(&entry_arc);
+            let entry = entry_arc.lock().unwrap();
+            match entry.status {
+                EntryStatus::AVAILABLE => {
+                    // should not happen
+                    eprintln!("Error: entry should not be available at this point");
+                    return None;
+                }
                 EntryStatus::CALCULATING => {
                     println!("CALCULATING");
-                    // cache_entry.wait();
-                    return Some(cache_entry.clone());
+                    match entry.cond_var.wait_while(
+                        entry_arc_clone.lock().unwrap(), 
+                        |entry: &mut Entry<D>| entry.status == EntryStatus::CALCULATING)
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Error while waiting: {:?}", e);
+                                return None;
+                            }
+                        }
                 }
                 _ => {}
             }
-            return Some(cache_entry.clone());
-        };
+            return Some((entry.data, entry.adhoc_code));
+        }
         return None;
-
     }
 
     pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
@@ -158,58 +159,53 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
 
-        if let Some(cache_entry) = self.handle_hit(key) {
-            return Some((cache_entry.data, cache_entry.adhoc_code));
+        if let Some((data, adhoc_code)) = self.handle_hit(key) {
+            return Some((data, adhoc_code));
         }
 
         // Miss
-        let cache_entry_arc = {
+        let entry_arc = {
             let mut locked_cache = self.lru_cache.write().unwrap();
-            let cache_entry_arc = locked_cache.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
-            Arc::clone(&cache_entry_arc)
+            let entry_arc = locked_cache.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
+            Arc::clone(&entry_arc)
         };
 
-        let mut locked_cache_entry = cache_entry_arc.lock().unwrap();
-        let cache_entry_arc_clone = Arc::clone(&cache_entry_arc);
-        let cache_entry = locked_cache_entry.deref_mut();
+        let mut locked_entry = entry_arc.lock().unwrap();
+        let entry_arc_clone = Arc::clone(&entry_arc);
+        let entry = locked_entry.deref_mut();
 
-        match cache_entry.status {
+        match entry.status {
             EntryStatus::AVAILABLE => {
                 {
-                    cache_entry.status = EntryStatus::CALCULATING;                   
-                    if miss_handler(&key, &mut cache_entry.data, &mut cache_entry.adhoc_code) {
-                        cache_entry.expiration = Instant::now() + positive_ttl;
-                        cache_entry.status = EntryStatus::READY;
+                    entry.status = EntryStatus::CALCULATING;                   
+                    if miss_handler(&key, &mut entry.data, &mut entry.adhoc_code) {
+                        entry.expiration = Instant::now() + positive_ttl;
+                        entry.status = EntryStatus::READY;
                     } else {
-                        cache_entry.expiration = Instant::now() + negative_ttl;
-                        cache_entry.status = EntryStatus::FAILED;
+                        entry.expiration = Instant::now() + negative_ttl;
+                        entry.status = EntryStatus::FAILED;
                     }
                 }
-                cache_entry.cond_var.notify_all();
+                entry.cond_var.notify_all();
             }
             EntryStatus::CALCULATING => {
                 println!("CALCULATING");
-                match cache_entry.cond_var.wait_while(
-                    cache_entry_arc_clone.lock().unwrap(), 
+                match entry.cond_var.wait_while(
+                    entry_arc_clone.lock().unwrap(), 
                     |entry: &mut Entry<D>| entry.status == EntryStatus::CALCULATING)
                     {
                         Ok(_) => {}
                         Err(e) => {
                             eprintln!("Error while waiting: {:?}", e);
+                            return None;
                         }
                     }
             }
-            // _ => {}
-            EntryStatus::READY => {
-                println!("READY");
-            }
-            EntryStatus::FAILED => {
-                println!("FAILED");
-            }
+            EntryStatus::READY | EntryStatus::FAILED => {}
         }
         
         
-        Some((cache_entry.data, cache_entry.adhoc_code))
+        Some((entry.data, entry.adhoc_code))
     }
 }
 
