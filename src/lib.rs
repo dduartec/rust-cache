@@ -70,7 +70,7 @@ pub struct Cache<K, D> {
     negative_ttl: Duration, // seconds
 }
 
-impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
+impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
     pub fn new(
         size: usize,
         miss_handler: MissHandler<K, D>,
@@ -89,17 +89,17 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         }
     }
 
-    pub fn insert(&self, key: &K, data: &D) {
+    pub fn insert(&self, key: &K, data: D) {
         let expiration = Instant::now() + self.positive_ttl;
-        let entry = Entry::new(*data, expiration, 0);
+        let entry = Entry::new(data, expiration, 0);
         let entry_arc = Arc::new(Mutex::new(entry));
-        self.lru_cache.write().unwrap().put(*key, entry_arc);        
+        self.lru_cache.write().unwrap().put(key.clone(), entry_arc);        
     }
 
     pub fn get(&self, key: &K) -> Option<D> {
-        if let Some(entry_arc) = self.get_entry(key) {
+        if let Some(entry_arc) = self.get_entry(&key) {
             let entry = entry_arc.lock().unwrap();
-            return Some(entry.data);
+            return Some(entry.data.clone());
         }
         None
     }
@@ -149,7 +149,7 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
                 }
                 _ => {}
             }
-            return Some((entry.data, entry.adhoc_code));
+            return Some((entry.data.clone(), entry.adhoc_code));
         }
         return None;
     }
@@ -159,14 +159,14 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
 
-        if let Some((data, adhoc_code)) = self.handle_hit(key) {
+        if let Some((data, adhoc_code)) = self.handle_hit(&key) {
             return Some((data, adhoc_code));
         }
 
         // Miss
         let entry_arc = {
             let mut locked_cache = self.lru_cache.write().unwrap();
-            let entry_arc = locked_cache.get_or_insert_mut(*key, || Arc::new(Mutex::new(Entry::default())));
+            let entry_arc = locked_cache.get_or_insert_mut(key.clone(), || Arc::new(Mutex::new(Entry::default())));
             Arc::clone(&entry_arc)
         };
 
@@ -205,7 +205,7 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
         }
         
         
-        Some((entry.data, entry.adhoc_code))
+        Some((entry.data.clone(), entry.adhoc_code))
     }
 }
 
@@ -216,7 +216,7 @@ impl<K: Eq + Hash + Copy, D: Eq + Default + Copy> Cache<K, D> {
 #[cfg(test)]
 mod tests {
 
-    use std::thread;
+    use std::{result, thread};
 
     use super::*;
     use rstest::*;
@@ -247,7 +247,7 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key, &value);
+        simple_cache.insert(&key, value);
 
         // Assert
         assert_eq!(simple_cache.len(), 1);
@@ -260,8 +260,8 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key, &value);
-        simple_cache.insert(&key, &value);
+        simple_cache.insert(&key, value);
+        simple_cache.insert(&key, value);
 
         // Assert
         assert_eq!(simple_cache.len(), 1);
@@ -274,7 +274,7 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key, &value);
+        simple_cache.insert(&key, value);
 
         // Assert
         assert_eq!(simple_cache.get(&key), Some(value));
@@ -299,10 +299,10 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key1, &value);
-        simple_cache.insert(&key2, &value);
-        simple_cache.insert(&key3, &value);
-        simple_cache.insert(&key4, &value);
+        simple_cache.insert(&key1, value);
+        simple_cache.insert(&key2, value);
+        simple_cache.insert(&key3, value);
+        simple_cache.insert(&key4, value);
 
         // Assert
         assert_eq!(simple_cache.len(), 3);
@@ -319,11 +319,11 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key1, &value);
-        simple_cache.insert(&key2, &value);
+        simple_cache.insert(&key1, value);
+        simple_cache.insert(&key2, value);
         simple_cache.get(&key1); // key2 is now the lru
-        simple_cache.insert(&key3, &value);
-        simple_cache.insert(&key4, &value);
+        simple_cache.insert(&key3, value);
+        simple_cache.insert(&key4, value);
 
         // Assert
         assert_eq!(simple_cache.len(), 3);
@@ -337,7 +337,7 @@ mod tests {
         let value = 2;
 
         // Act
-        simple_cache.insert(&key, &value);
+        simple_cache.insert(&key, value);
         std::thread::sleep(std::time::Duration::from_millis(250));
 
         // Assert
@@ -538,5 +538,258 @@ mod tests {
         assert!(duration.as_secs() < 1);
         assert_eq!(not_in_cache_count, 2);
     }
+
+    #[rstest]
+    fn test_thread_safe_heavy_threads(time_consuming_mh: Cache<i32, i32>) {
+        let cache = Arc::new(time_consuming_mh);
+        for _ in 0..50 {            
+            // Arrange
+            let n_keys = 5;
+            let entries_per_key = 20;
+            let results = vec![(0,0); n_keys * entries_per_key];
+            let results_arc = Arc::new(RwLock::new(results));
+            let mut threads = Vec::<thread::JoinHandle<_>>::with_capacity(n_keys * entries_per_key);
+
+            // Act
+            for i in 0..n_keys {
+                for j in 0..entries_per_key {
+                    let cache_clone = Arc::clone(&cache);
+                    let results_clone = Arc::clone(&results_arc);
+                    threads.push(thread::spawn(move || {
+                        let key = (i + 1) as i32;
+                        let (data, adhoc_code) = cache_clone.retrieve_or_compute(&key).unwrap();
+                        let mut results = results_clone.write().unwrap();
+                        results[i*entries_per_key+j] = (data, adhoc_code);
+                    }));
+                }
+            }
+            for handle in threads {
+                let res = handle.join();
+                // assert res is ok
+                assert!(res.is_ok());
+                res.unwrap();
+            }
+
+            // Assert
+            for i in (0..n_keys * entries_per_key).step_by(entries_per_key) {
+                let results = results_arc.read().unwrap();
+                let res_i = results[i];
+                for j in 1..entries_per_key {
+                    let res_j = results[i+j];
+                    assert_eq!(res_i, res_j);
+                }
+            }
+            assert!(cache.len() == n_keys);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Hash, Copy, Default)]
+    struct SimpleStruct {
+        value: i32,
+    }
+    #[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
+    struct ComplexKey {
+        id: i32,
+        name: String,
+        nested: SimpleStruct,
+        array: Vec<i32>,
+
+    }
+
+  #[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
+    struct ComplexData {
+        value: i32,
+        description: String,
+        nested: SimpleStruct,
+        array: Vec<i32>,
+    }
+
+    #[fixture]
+    fn complex_key_and_data_cache() -> Cache<ComplexKey, ComplexData> {
+        fn miss_handler(key: &ComplexKey, data: &mut ComplexData, adhoc_code: &mut u8) -> bool {
+            // wait 500 ms
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // FAIL if key.id is -1
+            if key.id == -1 {
+                return false
+            }
+            data.value = key.id * 2;
+            data.description = key.name.clone();
+            data.nested = key.nested.clone();
+            data.array = key.array.clone();
+            *adhoc_code += 1; // should always be 1
+            true
+        }
+        Cache::new(
+            200,
+            miss_handler,
+            Duration::from_secs(1),          
+            Duration::from_secs(1),          
+        )
+    }
+
+    #[rstest]
+    fn complex_key_and_data_cache_insert(complex_key_and_data_cache: Cache<ComplexKey, ComplexData>) {
+        // Arrange
+        let key = ComplexKey {
+            id: 1,
+            name: "name".to_string(),
+            nested: SimpleStruct { value: 1 },
+            array: vec![1, 2, 3],
+        };
+        let data = ComplexData {
+            value: 2,
+            description: "name".to_string(),
+            nested: SimpleStruct { value: 1 },
+            array: vec![1, 2, 3],
+        };
+
+        // Act
+        complex_key_and_data_cache.insert(&key, data);
+
+        // Assert
+        assert_eq!(complex_key_and_data_cache.len(), 1);
+    }
+
+    #[rstest]
+    fn complex_key_data_retrieve_or_compute(complex_key_and_data_cache: Cache<ComplexKey, ComplexData>) {
+        // Arrange
+        let key = ComplexKey {
+            id: 1,
+            name: "name".to_string(),
+            nested: SimpleStruct { value: 1 },
+            array: vec![1, 2, 3],
+        };
+
+        // Act
+        let (data, adhoc_code) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
+
+        // Assert
+        assert_eq!(data.value, 2);
+        assert_eq!(data.description, "name");
+        assert_eq!(data.nested, SimpleStruct { value: 1 });
+        assert_eq!(data.array, vec![1, 2, 3]);
+        assert_eq!(adhoc_code, 1);
+        assert_eq!(complex_key_and_data_cache.len(), 1);    
+    }
+
+    #[rstest]
+    fn complex_key_data_retrieve_or_compute_change_key(complex_key_and_data_cache: Cache<ComplexKey, ComplexData>) {
+        // Arrange
+        let key = ComplexKey {
+            id: 1,
+            name: "name".to_string(),
+            nested: SimpleStruct { value: 1 },
+            array: vec![1, 2, 3],
+        };
+        let key_clone = key.clone();
+        let mut key_change = key.clone();
+        key_change.id = 2;
+
+        // Act
+        let (data, _) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
+        let (data1, _) = complex_key_and_data_cache.retrieve_or_compute(&key_clone).unwrap();
+        let (data2, _) = complex_key_and_data_cache.retrieve_or_compute(&key_change).unwrap();
+
+        // Assert
+        assert_eq!(data, data1);
+        assert_ne!(data, data2);
+        assert_eq!(complex_key_and_data_cache.len(), 2);
+    }
+
+    #[rstest]
+    fn complex_key_data_thread_safe_cache_same_key(complex_key_and_data_cache: Cache<ComplexKey, ComplexData>) {
+        // Arrange
+        let cache = Arc::new(complex_key_and_data_cache);
+        let n_threads: i32 = 200;
+        let start = Instant::now();
+        let key = ComplexKey {
+            id: 1,
+            name: "name".to_string(),
+            nested: SimpleStruct { value: 1 },
+            array: vec![1, 2, 3],
+        };
+
+        // Act
+        let handles: Vec<_> = (0..n_threads).map(|i| {
+            let cache_clone = Arc::clone(&cache);
+            thread::Builder::new().name(format!("Thread {}", i)).spawn({
+            let value = key.clone();
+            move || {
+            cache_clone.retrieve_or_compute(&value)
+            }
+            })
+        }).collect();
+
+        // Assert
+        let results = handles.into_iter().map(|handle| handle.unwrap().join());
+        for res in results {
+            // assert res is ok
+            assert!(res.is_ok());
+            if let Some((data, adhoc_code)) = res.unwrap() {
+                assert_eq!(data.value, 2);
+                assert_eq!(data.description, "name");
+                assert_eq!(data.nested, SimpleStruct { value: 1 });
+                assert_eq!(data.array, vec![1, 2, 3]);
+                assert_eq!(adhoc_code, 1);
+            }
+        }        
+        let duration = start.elapsed();
+        assert!(cache.len() == 1);
+        assert!(duration.as_secs() < 1);
+        
+    }
+
+    #[rstest]
+    fn complex_key_data_thread_safe_cache_different_keys(complex_key_and_data_cache: Cache<ComplexKey, ComplexData>) {
+        // Arrange
+        let cache = Arc::new(complex_key_and_data_cache);
+        let n_threads = 200;
+        let start = Instant::now();
+
+        // Act
+        let handles: Vec<_> = (0..n_threads).map(|i| {
+            let cache_clone = Arc::clone(&cache);
+            let key: ComplexKey = ComplexKey {
+                id: 1 + i,
+                name: "name".to_string(),
+                nested: SimpleStruct { value: 1 },
+                array: vec![1, 2, 3],
+            };
+            thread::spawn({ move || {
+            cache_clone.retrieve_or_compute(&key)
+            }
+            })
+        }).collect();
+
+        for handle in handles {
+            let res = handle.join();
+            // assert res is ok
+            assert!(res.is_ok());
+            res.unwrap();
+        }
+
+        // Assert        
+        for i in 0..n_threads {
+            let key = ComplexKey {
+                id: 1 + i,
+                name: "name".to_string(),
+                nested: SimpleStruct { value: 1 },
+                array: vec![1, 2, 3],
+            };
+            let data = cache.get(&key);
+
+            assert_eq!(data, Some(ComplexData {
+                value: (1 + i) * 2,
+                description: "name".to_string(),
+                nested: SimpleStruct { value: 1 },
+                array: vec![1, 2, 3],
+            }));
+        }
+        assert!(cache.len() == n_threads.try_into().unwrap());
+        let duration = start.elapsed();
+        assert!(duration.as_secs() < 1);
+    }
+
 
 }
