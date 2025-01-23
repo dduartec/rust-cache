@@ -6,8 +6,8 @@
 //! ## Example
 //!
 //! ```rust
-//! extern crate rust_cache;
-//! use rust_cache::Cache;
+//! extern crate gs_rust_cache;
+//! use gs_rust_cache::Cache;
 //!
 //!fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
 //!    // Your Code Here
@@ -188,7 +188,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
         }
         return None;
     }
-    
+
     pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
         self.retrieve_or_compute_with_params(key, &[])
     }

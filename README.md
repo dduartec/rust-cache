@@ -23,7 +23,7 @@ rust-cache = "0.1.0"
 Here's a basic example of how to use the Rust Cache library:
 
 ```rust
-use rust_cache::Cache;
+use gs_rust_cache::Cache;
 
 fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
     // Your Code Here
