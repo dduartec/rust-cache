@@ -2,6 +2,16 @@
 name = "rust-cache"
 version = "0.1.0"
 edition = "2021"
+description = """
+Thread safe cache developed using lru crate (https://crates.io/crates/lru) as its core. 
+Supports LRU, positive and negative TTLs and miss handler function.
+"""
+license = "MIT"
+keywords = ["cache", "lru", "thread-safe"]
+categories = ["cache"]
+readme = "README.md"
+repository = "https://github.com/dduartec/rust-cache.git"
+homepage = "https://github.com/dduartec/rust-cache"
 
 [dependencies]
 lru = "0.12.5"
