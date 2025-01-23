@@ -3,7 +3,8 @@ use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
+use std::any::Any;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum EntryStatus {
@@ -61,7 +62,7 @@ impl<D: Default> Entry<D> {
 
 }
 
-pub type MissHandler<K, D> = fn(&K, &mut D, &mut u8) -> bool;
+pub type MissHandler<K, D> = fn(&K, &mut D, &mut u8, &[&dyn Any]) -> bool;
 
 pub struct Cache<K, D> {
     lru_cache: Arc<Mutex<LruCache<K, Arc<Mutex<Entry<D>>>>>>,
@@ -153,8 +154,11 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
         }
         return None;
     }
-
     pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
+        self.retrieve_or_compute_with_params(key, &[])
+    }
+
+    pub fn retrieve_or_compute_with_params(&self, key: &K, params: &[&dyn Any]) -> Option<(D, u8)> {
         let miss_handler = self.miss_handler;
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
@@ -178,7 +182,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
             EntryStatus::AVAILABLE => {
                 {
                     locked_entry.status = EntryStatus::CALCULATING;
-                    if miss_handler(&key, &mut locked_entry.data, &mut locked_entry.adhoc_code) {
+                    if miss_handler(&key, &mut locked_entry.data, &mut locked_entry.adhoc_code, params) {
                         locked_entry.expiration = Instant::now() + positive_ttl;
                         locked_entry.status = EntryStatus::READY;
                     } else {
@@ -223,7 +227,7 @@ mod tests {
 
     #[fixture]
     fn simple_cache() -> Cache<i32, i32> {
-        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8) -> bool {
+        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
             // FAIL if key is -1
             if *key == -1 {
                 return false
@@ -414,8 +418,84 @@ mod tests {
     }
 
     #[fixture]
+    fn simple_cache_with_params () -> Cache<i32, i32> {
+        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, params: &[&dyn Any]) -> bool {
+            
+            // FAIL if key is -1
+            if *key == -1 {
+                return false
+            }
+            *data = key * 2;
+            for param in params {
+                if let Some(param) = param.downcast_ref::<i32>() {
+                    *data += param;
+                }
+            }
+            if params[0].downcast_ref::<&str>().is_some() {
+                *adhoc_code += 1;
+            }
+            *adhoc_code += 1; // should always be 1
+            true
+        }
+        Cache::new(
+            3,
+            miss_handler,
+            Duration::from_millis(200),          
+            Duration::from_millis(100),          
+        )
+    }
+
+    #[rstest]
+    fn retrieve_or_compute_with_params(simple_cache_with_params: Cache<i32, i32>){
+        // Arrange
+        let key = 1;
+        let param = 3;
+
+        // Act
+        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param]).unwrap();
+
+        // Assert
+        assert_eq!(data, 5);
+        assert_eq!(adhoc_code, 1);
+        assert_eq!(simple_cache_with_params.len(), 1);
+    }
+
+    #[rstest]
+    fn retrieve_or_compute_with_multiple_params(simple_cache_with_params: Cache<i32, i32>){
+        // Arrange
+        let key = 1;
+        let param1 = 3;
+        let param2 = 4;
+
+        // Act
+        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2]).unwrap();
+
+        // Assert
+        assert_eq!(data, 9);
+        assert_eq!(adhoc_code, 1);
+        assert_eq!(simple_cache_with_params.len(), 1);
+    }
+    
+    #[rstest]
+    fn retrieve_or_compute_with_multiple_params_different_types(simple_cache_with_params: Cache<i32, i32>){
+        // Arrange
+        let key = 1;
+        let param1 = "hola";
+        let param2 = 3;
+        let param3 = 4;
+
+        // Act
+        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2, &param3]).unwrap();
+
+        // Assert
+        assert_eq!(data, 9);
+        assert_eq!(adhoc_code, 2);
+        assert_eq!(simple_cache_with_params.len(), 1);
+    }
+
+    #[fixture]
     fn time_consuming_mh() -> Cache<i32, i32> {
-        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8) -> bool {
+        fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
 
             std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -547,7 +627,7 @@ mod tests {
             let n_keys = 5;
             let entries_per_key = 20;
             let results = vec![(0,0); n_keys * entries_per_key];
-            let results_arc = Arc::new(RwLock::new(results));
+            let results_arc = Arc::new(Mutex::new(results));
             let mut threads = Vec::<thread::JoinHandle<_>>::with_capacity(n_keys * entries_per_key);
 
             // Act
@@ -558,7 +638,7 @@ mod tests {
                     threads.push(thread::spawn(move || {
                         let key = (i + 1) as i32;
                         let (data, adhoc_code) = cache_clone.retrieve_or_compute(&key).unwrap();
-                        let mut results = results_clone.write().unwrap();
+                        let mut results = results_clone.lock().unwrap();
                         results[i*entries_per_key+j] = (data, adhoc_code);
                     }));
                 }
@@ -572,7 +652,7 @@ mod tests {
 
             // Assert
             for i in (0..n_keys * entries_per_key).step_by(entries_per_key) {
-                let results = results_arc.read().unwrap();
+                let results = results_arc.lock().unwrap();
                 let res_i = results[i];
                 for j in 1..entries_per_key {
                     let res_j = results[i+j];
@@ -606,7 +686,7 @@ mod tests {
 
     #[fixture]
     fn complex_key_and_data_cache() -> Cache<ComplexKey, ComplexData> {
-        fn miss_handler(key: &ComplexKey, data: &mut ComplexData, adhoc_code: &mut u8) -> bool {
+        fn miss_handler(key: &ComplexKey, data: &mut ComplexData, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
             // wait 500 ms
             std::thread::sleep(std::time::Duration::from_millis(500));
             // FAIL if key.id is -1
