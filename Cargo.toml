@@ -7,7 +7,7 @@ description = """
 Thread safe cache developed using lru crate(https://crates.io/crates/lru) as its core. 
 Supports LRU, positive and negative TTLs and miss handler function.
 """
-keywords = ["cache", "lru", "thread-safe"]
+keywords = ["caching"]
 categories = ["cache"]
 readme = "README.md"
 repository = "https://github.com/dduartec/rust-cache.git"
