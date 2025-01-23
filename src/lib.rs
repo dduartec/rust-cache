@@ -1,3 +1,37 @@
+//! Thread safe cache developed using [lru crate](https://crates.io/crates/lru) as its core. 
+//! Supports LRU, positive and negative TTLs and miss handler function.
+//! It is intended to be used using the function `retrieve_or_compute`, which will return the value if it is in the cache,
+//! or compute it using the miss_handler function if it is not.
+//!
+//! ## Example
+//!
+//! ```rust
+//! extern crate rust_cache;
+//! use rust_cache::Cache;
+//!
+//!fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
+//!    // Your Code Here
+//!    *data = 123;
+//!    *adhoc_code = 200;
+//!    true
+//! }
+//! 
+//! fn main() {
+//!     let mut cache = Cache<i32, i32>::new(
+//!         size: 3,
+//!         miss_handler,
+//!         positive_ttl: Duration::from_millis(200),          
+//!         negative_ttl: Duration::from_millis(100),          
+//!     );
+//! 
+//!     let key =  456;
+//!     let value = cache.retrieve_or_compute(&key); // first one is calculated
+//!     let value_1 = cache.retrieve_or_compute(&key); // afterwards it is retrieved
+//! 
+//!     assert_eq!(value, value_1);    
+//! }
+//! ```
+
 use lru::{LruCache, DefaultHasher};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
@@ -154,6 +188,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
         }
         return None;
     }
+    
     pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
         self.retrieve_or_compute_with_params(key, &[])
     }
@@ -220,7 +255,7 @@ impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
 #[cfg(test)]
 mod tests {
 
-    use std::{result, thread};
+    use std::thread;
 
     use super::*;
     use rstest::*;
