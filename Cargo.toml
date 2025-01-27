@@ -1,6 +1,6 @@
 [package]
-name = "gs_rust_cache"
-version = "0.1.0"
+name = "gs-rust-cache"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = """
