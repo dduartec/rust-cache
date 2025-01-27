@@ -8,6 +8,8 @@
 //! ```rust
 //! extern crate gs_rust_cache;
 //! use gs_rust_cache::Cache;
+//! use std::any::Any;
+//! use std::time::Duration;
 //!
 //!fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
 //!    // Your Code Here
@@ -17,11 +19,11 @@
 //! }
 //! 
 //! fn main() {
-//!     let mut cache = Cache<i32, i32>::new(
-//!         size: 3,
+//!     let mut cache = Cache::new(
+//!         3,
 //!         miss_handler,
-//!         positive_ttl: Duration::from_millis(200),          
-//!         negative_ttl: Duration::from_millis(100),          
+//!         Duration::from_millis(200),          
+//!         Duration::from_millis(100),          
 //!     );
 //! 
 //!     let key =  456;
@@ -105,7 +107,7 @@ pub struct Cache<K, D> {
     negative_ttl: Duration, // seconds
 }
 
-impl<K: Eq + Hash + Clone, D: Eq + Default + Clone> Cache<K, D> {
+impl<K: Eq + Hash + Clone, D: Default + Clone> Cache<K, D> {
     pub fn new(
         size: usize,
         miss_handler: MissHandler<K, D>,
