@@ -535,6 +535,9 @@ mod tests {
         fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) -> bool {
 
             std::thread::sleep(std::time::Duration::from_millis(500));
+            if *key == 3 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
 
             *data = key * 2;
             *adhoc_code += 1; // should always be 1
@@ -558,23 +561,30 @@ mod tests {
         // Act
         let handles: Vec<_> = (0..n_threads).map(|i| {
             let cache_clone = Arc::clone(&cache);
-            thread::Builder::new().name(format!("Thread {}", i)).spawn(move || {
-            let key = 456;
-            cache_clone.retrieve_or_compute(&key)
+            thread::spawn({
+                move || {
+                    let key = 456;
+                    let start = Instant::now();
+                    let res = cache_clone.retrieve_or_compute(&key);
+                    (res, start.elapsed())
+                }
             })
         }).collect();
 
         // Assert
-        let results = handles.into_iter().map(|handle| handle.unwrap().join());
+        let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
+        let duration = start.elapsed();
         for res in results {
             // assert res is ok
             assert!(res.is_ok());
-            if let Some((data, adhoc_code)) = res.unwrap() {
-                assert_eq!(data, 456 * 2);
-                assert_eq!(adhoc_code, 1);
+            if let (Some((data, adhoc_code)), elapsed) = res.as_ref().unwrap() {
+                let key = 456;
+                assert_eq!(*data, key * 2);
+                assert_eq!(*adhoc_code, 1);
+                assert!(elapsed.as_millis() < 600);
             }
         }        
-        let duration = start.elapsed();
+        
         assert!(cache.len() == 1);
         assert!(duration.as_secs() < 1);
         
@@ -590,27 +600,36 @@ mod tests {
         // Act
         let handles: Vec<_> = (0..n_threads).map(|i| {
             let cache_clone = Arc::clone(&cache);
-            thread::spawn(move || {
-                let key = 456 + i;
-                cache_clone.retrieve_or_compute(&key);
+            thread::spawn({
+                move || {
+                    let key = 456 + i as i32;
+                    let start = Instant::now();
+                    let res = cache_clone.retrieve_or_compute(&key);
+                    (res, start.elapsed())
+                }
             })
         }).collect();
-
-        for handle in handles {
-            let res = handle.join();
+let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
+        
+        let duration = start.elapsed();
+        // Assert
+        for i in 0..n_threads {
+            let res = &results[i];
             // assert res is ok
             assert!(res.is_ok());
-            res.unwrap();
-        }
-
-        // Assert        
+            if let (Some((data, adhoc_code)), elapsed) = res.as_ref().unwrap() {
+                let key = 456 + i as i32;
+                assert_eq!(*data, key * 2);
+                assert_eq!(*adhoc_code, 1);
+                assert!(elapsed.as_millis() < 600);
+            }
+        }      
         for i in 0..n_threads {
-            let key = 456 + i;
+            let key = 456 + i as i32;
             let data = cache.get(&key);
             assert_eq!(data, Some(key * 2));
         }
         assert!(cache.len() == n_threads.try_into().unwrap());
-        let duration = start.elapsed();
         assert!(duration.as_secs() < 1);
     }
 
@@ -663,7 +682,7 @@ mod tests {
             // Arrange
             let n_keys = 5;
             let entries_per_key = 20;
-            let results = vec![(0,0); n_keys * entries_per_key];
+            let results = vec![((0,0), Duration::default()); n_keys * entries_per_key];
             let results_arc = Arc::new(Mutex::new(results));
             let mut threads = Vec::<thread::JoinHandle<_>>::with_capacity(n_keys * entries_per_key);
 
@@ -674,9 +693,10 @@ mod tests {
                     let results_clone = Arc::clone(&results_arc);
                     threads.push(thread::spawn(move || {
                         let key = (i + 1) as i32;
+                        let start = Instant::now();
                         let (data, adhoc_code) = cache_clone.retrieve_or_compute(&key).unwrap();
                         let mut results = results_clone.lock().unwrap();
-                        results[i*entries_per_key+j] = (data, adhoc_code);
+                        results[i*entries_per_key+j] = ((data, adhoc_code), start.elapsed());
                     }));
                 }
             }
@@ -689,11 +709,17 @@ mod tests {
 
             // Assert
             for i in (0..n_keys * entries_per_key).step_by(entries_per_key) {
+                let key = i + 1;
                 let results = results_arc.lock().unwrap();
-                let res_i = results[i];
+                let (res_i, elapsed_i) = results[i];
                 for j in 1..entries_per_key {
-                    let res_j = results[i+j];
+                    let (res_j, elapsed_j) = results[i+j];
                     assert_eq!(res_i, res_j);
+                    if key != 3 {
+                        assert!(elapsed_i.as_millis() < 600);
+                        assert!(elapsed_j.as_millis() < 600);
+                    }
+
                 }
             }
             assert!(cache.len() == n_keys);
