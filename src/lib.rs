@@ -678,7 +678,7 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
     #[rstest]
     fn test_thread_safe_heavy_threads(time_consuming_mh: Cache<i32, i32>) {
         let cache = Arc::new(time_consuming_mh);
-        for _ in 0..50 {
+        for cicle in 0..50 {
             // Arrange
             let n_keys = 5;
             let entries_per_key = 20;
@@ -708,14 +708,19 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
             }
 
             // Assert
+            let mut key = 0;
             for i in (0..n_keys * entries_per_key).step_by(entries_per_key) {
-                let key = i + 1;
+                key += 1;
                 let results = results_arc.lock().unwrap();
                 let (res_i, elapsed_i) = results[i];
                 for j in 1..entries_per_key {
                     let (res_j, elapsed_j) = results[i+j];
                     assert_eq!(res_i, res_j);
-                    if key != 3 {
+                    println!("key : {} i: {} j: {}", key,  elapsed_i.as_millis(), elapsed_j.as_millis());
+                    if cicle ==0 && key == 3 {                        
+                        assert!(elapsed_i.as_millis() > 600);
+                        assert!(elapsed_j.as_millis() > 600);
+                    } else {
                         assert!(elapsed_i.as_millis() < 600);
                         assert!(elapsed_j.as_millis() < 600);
                     }
