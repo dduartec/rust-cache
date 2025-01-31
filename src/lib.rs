@@ -143,16 +143,22 @@ impl<K: Eq + Hash + Clone, D: Default + Clone> Cache<K, D> {
 
     fn get_entry(&self, key: &K) -> Option<Arc<Mutex<Entry<D>>>> {
         // lock the cache
-        let mut cache = self.lru_cache.lock().unwrap();
+        let cache_entry = {
+            let mut cache = self.lru_cache.lock().unwrap();
+            cache.get(key).map(|entry| Arc::clone(entry))
+        };
         // check if the entry exists and is valid
-        if let Some(entry_arc) = cache.get(key) {
-            let entry = entry_arc.lock().unwrap();
-            if entry.is_valid() {
-                return Some(Arc::clone(&entry_arc));
-            }
+        match cache_entry {
+            None => return None,
+            Some(entry_arc) => {
+                let entry = entry_arc.lock().unwrap();
+                if entry.is_valid() {
+                    return Some(Arc::clone(&entry_arc));
+                }
+            }            
         }
         // if the entry is not valid or does not exist, remove it
-        cache.pop(key);
+        self.lru_cache.lock().unwrap().pop(key);
         None
     }
 
