@@ -15,7 +15,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rust-cache = "0.1.0"
+rust-cache = "0.1.3"
 ```
 
 ## Usage
@@ -33,18 +33,21 @@ fn miss_handler(key: &i32, data: &mut i32, adhoc_code: &mut u8, _: &[&dyn Any]) 
 }
 
 fn main() {
-    let mut cache = Cache<i32, i32>::new(
-        size: 3,
+    let mut cache = Cache::new(
+        3,
         miss_handler,
-        positive_ttl: Duration::from_millis(200),          
-        negative_ttl: Duration::from_millis(100),          
+        Duration::from_millis(200),          
+        Duration::from_millis(100),          
     );
 
-    let key =  456;
-    let value = cache.retrieve_or_compute(&key); // first one is calculated
-    let value_1 = cache.retrieve_or_compute(&key); // afterwards it is retrieved
+    let key = 456;
+    let (value, adhoc_code, is_hit) = cache.retrieve_or_compute(&key); // first one is calculated
+    let (value_1, adhoc_code_1, is_hit_1) = cache.retrieve_or_compute(&key); // afterwards it is retrieved
 
-    assert_eq!(value, value_1);    
+    assert_eq!(value, value_1);
+    assert_eq!(adhoc_code, adhoc_code_1);
+    assert!(is_hit); // is_hit is false because the value was computed
+    assert!(is_hit_1); // is_hit_1 is true because the value was retrieved from the cache
 }
 ```
 

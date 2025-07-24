@@ -27,10 +27,14 @@
 //!     );
 //! 
 //!     let key =  456;
-//!     let value = cache.retrieve_or_compute(&key); // first one is calculated
-//!     let value_1 = cache.retrieve_or_compute(&key); // afterwards it is retrieved
+//!     let (value, adhoc_code, is_hit) = cache.retrieve_or_compute(&key); // first one is calculated
+//!     let (value_1, adhoc_code_1, is_hit_1) = cache.retrieve_or_compute(&key); // afterwards it is retrieved
 //! 
-//!     assert_eq!(value, value_1);    
+//!     assert_eq!(value, value_1);
+//!     assert_eq!(adhoc_code, adhoc_code_1);
+//!     assert!(is_hit); // is_hit is false because the value was computed
+//!     assert!(is_hit_1); // is_hit_1 is true because the value was retrieved from the cache
+//! 
 //! }
 //! ```
 
@@ -197,17 +201,17 @@ impl<K: Eq + Hash + Clone, D: Default + Clone> Cache<K, D> {
         return None;
     }
 
-    pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8)> {
+    pub fn retrieve_or_compute(&self, key: &K) -> Option<(D, u8, bool)> {
         self.retrieve_or_compute_with_params(key, &[])
     }
 
-    pub fn retrieve_or_compute_with_params(&self, key: &K, params: &[&dyn Any]) -> Option<(D, u8)> {
+    pub fn retrieve_or_compute_with_params(&self, key: &K, params: &[&dyn Any]) -> Option<(D, u8, bool)> {
         let miss_handler = self.miss_handler;
         let positive_ttl = self.positive_ttl;
         let negative_ttl = self.negative_ttl;
 
         if let Some((data, adhoc_code)) = self.handle_hit(&key) {
-            return Some((data, adhoc_code));
+            return Some((data, adhoc_code, true));
         }
 
         // Miss
@@ -252,7 +256,7 @@ impl<K: Eq + Hash + Clone, D: Default + Clone> Cache<K, D> {
         }
         
         
-        Some((locked_entry.data.clone(), locked_entry.adhoc_code))
+        Some((locked_entry.data.clone(), locked_entry.adhoc_code, false))
     }
 }
 
@@ -397,11 +401,12 @@ mod tests {
         let key = 1;
 
         // Act
-        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key).unwrap();
+        let (data, adhoc_code, is_hit) = simple_cache.retrieve_or_compute(&key).unwrap();
 
         // Assert
         assert_eq!(data, 2);
         assert_eq!(adhoc_code, 1);
+        assert_eq!(is_hit, false);
         assert_eq!(simple_cache.len(), 1);
     }
 
@@ -415,11 +420,12 @@ mod tests {
         simple_cache.retrieve_or_compute(&key);
         simple_cache.retrieve_or_compute(&key);
         simple_cache.retrieve_or_compute(&key);
-        let (data, adhoc_code) = simple_cache.retrieve_or_compute(&key).unwrap();
+        let (data, adhoc_code, is_hit) = simple_cache.retrieve_or_compute(&key).unwrap();
 
         // Assert
         assert_eq!(data, 2);
         assert_eq!(adhoc_code, 1);
+        assert_eq!(is_hit, true);
         assert_eq!(simple_cache.len(), 1);
     }
 
@@ -495,11 +501,12 @@ mod tests {
         let param = 3;
 
         // Act
-        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param]).unwrap();
+        let (data, adhoc_code, is_hit) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param]).unwrap();
 
         // Assert
         assert_eq!(data, 5);
         assert_eq!(adhoc_code, 1);
+        assert_eq!(is_hit, false);
         assert_eq!(simple_cache_with_params.len(), 1);
     }
 
@@ -511,11 +518,12 @@ mod tests {
         let param2 = 4;
 
         // Act
-        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2]).unwrap();
+        let (data, adhoc_code, is_hit) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2]).unwrap();
 
         // Assert
         assert_eq!(data, 9);
         assert_eq!(adhoc_code, 1);
+        assert_eq!(is_hit, false);
         assert_eq!(simple_cache_with_params.len(), 1);
     }
     
@@ -528,11 +536,12 @@ mod tests {
         let param3 = 4;
 
         // Act
-        let (data, adhoc_code) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2, &param3]).unwrap();
+        let (data, adhoc_code, is_hit) = simple_cache_with_params.retrieve_or_compute_with_params(&key, &[&param1, &param2, &param3]).unwrap();
 
         // Assert
         assert_eq!(data, 9);
         assert_eq!(adhoc_code, 2);
+        assert_eq!(is_hit, false);
         assert_eq!(simple_cache_with_params.len(), 1);
     }
 
@@ -583,7 +592,7 @@ mod tests {
         for res in results {
             // assert res is ok
             assert!(res.is_ok());
-            if let (Some((data, adhoc_code)), elapsed) = res.as_ref().unwrap() {
+            if let (Some((data, adhoc_code, _)), elapsed) = res.as_ref().unwrap() {
                 let key = 456;
                 assert_eq!(*data, key * 2);
                 assert_eq!(*adhoc_code, 1);
@@ -623,7 +632,7 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
             let res = &results[i];
             // assert res is ok
             assert!(res.is_ok());
-            if let (Some((data, adhoc_code)), elapsed) = res.as_ref().unwrap() {
+            if let (Some((data, adhoc_code, _)), elapsed) = res.as_ref().unwrap() {
                 let key = 456 + i as i32;
                 assert_eq!(*data, key * 2);
                 assert_eq!(*adhoc_code, 1);
@@ -700,7 +709,7 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
                     threads.push(thread::spawn(move || {
                         let key = (i + 1) as i32;
                         let start = Instant::now();
-                        let (data, adhoc_code) = cache_clone.retrieve_or_compute(&key).unwrap();
+                        let (data, adhoc_code, _) = cache_clone.retrieve_or_compute(&key).unwrap();
                         let mut results = results_clone.lock().unwrap();
                         results[i*entries_per_key+j] = ((data, adhoc_code), start.elapsed());
                     }));
@@ -816,7 +825,7 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
         };
 
         // Act
-        let (data, adhoc_code) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
+        let (data, adhoc_code, is_hit) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
 
         // Assert
         assert_eq!(data.value, 2);
@@ -824,6 +833,7 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
         assert_eq!(data.nested, SimpleStruct { value: 1 });
         assert_eq!(data.array, vec![1, 2, 3]);
         assert_eq!(adhoc_code, 1);
+        assert_eq!(is_hit, false);
         assert_eq!(complex_key_and_data_cache.len(), 1);    
     }
 
@@ -841,9 +851,9 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
         key_change.id = 2;
 
         // Act
-        let (data, _) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
-        let (data1, _) = complex_key_and_data_cache.retrieve_or_compute(&key_clone).unwrap();
-        let (data2, _) = complex_key_and_data_cache.retrieve_or_compute(&key_change).unwrap();
+        let (data, _, _) = complex_key_and_data_cache.retrieve_or_compute(&key).unwrap();
+        let (data1, _, _) = complex_key_and_data_cache.retrieve_or_compute(&key_clone).unwrap();
+        let (data2, _, _) = complex_key_and_data_cache.retrieve_or_compute(&key_change).unwrap();
 
         // Assert
         assert_eq!(data, data1);
@@ -877,16 +887,23 @@ let results: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
 
         // Assert
         let results = handles.into_iter().map(|handle| handle.unwrap().join());
+        let mut i = 0;
         for res in results {
             // assert res is ok
             assert!(res.is_ok());
-            if let Some((data, adhoc_code)) = res.unwrap() {
+            if let Some((data, adhoc_code, is_hit)) = res.unwrap() {
                 assert_eq!(data.value, 2);
                 assert_eq!(data.description, "name");
                 assert_eq!(data.nested, SimpleStruct { value: 1 });
                 assert_eq!(data.array, vec![1, 2, 3]);
                 assert_eq!(adhoc_code, 1);
+                if i == 0 {
+                     assert!(!is_hit);
+                }else {
+                    assert!(is_hit);
+                }
             }
+            i += 1;
         }        
         let duration = start.elapsed();
         assert!(cache.len() == 1);
