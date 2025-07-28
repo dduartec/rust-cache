@@ -145,6 +145,17 @@ impl<K: Eq + Hash + Clone, D: Default + Clone> Cache<K, D> {
         None
     }
 
+    pub fn update(&self, key: &K, data: D) -> bool {
+        if let Some(entry_arc) = self.get_entry(&key) {
+            let mut entry = entry_arc.lock().unwrap();
+            entry.data = data;
+            entry.expiration = Instant::now() + self.positive_ttl;
+            entry.cond_var.notify_all(); // notify any waiting threads
+            return true;
+        }
+        false
+    }
+
     fn get_entry(&self, key: &K) -> Option<Arc<Mutex<Entry<D>>>> {
         // lock the cache
         let cache_entry = {
@@ -393,6 +404,35 @@ mod tests {
 
         // Assert
         assert_eq!(simple_cache.get(&key), None);
+    }
+
+    #[rstest]
+    fn update_value(simple_cache: Cache<i32, i32>) {
+        // Arrange
+        let key = 1;
+        let value = 2;
+
+        // Act
+        simple_cache.insert(&key, value);
+        let new_value = 3;
+        let success = simple_cache.update(&key, new_value);
+
+        // Assert
+        assert!(success);
+        assert_eq!(simple_cache.get(&key), Some(new_value));
+    }
+
+    #[rstest]
+    fn update_value_not_found(simple_cache: Cache<i32, i32>) {
+        // Arrange
+        let key = 1;
+        let new_value = 3;
+
+        // Act
+        let success = simple_cache.update(&key, new_value);
+
+        // Assert
+        assert!(!success);
     }
 
     #[rstest]
